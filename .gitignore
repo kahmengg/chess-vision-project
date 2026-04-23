@@ -1,0 +1,8 @@
+# Python bytecode (compiled files)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Large Binaries (The reason your push failed)
+*.exe
