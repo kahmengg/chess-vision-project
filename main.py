@@ -59,10 +59,11 @@ def _start_loop(overlay, vision, engine, config):
     empty_board_fen = "8/8/8/8/8/8/8/8"
     failed_reads = 0
     last_fen = None
-    last_moves = []
+    last_result = None   # FilterResult
+    last_smart_mode = getattr(config, "smart_mode", True)  # <--- 1. ADD THIS
 
     def worker():
-        nonlocal failed_reads, last_fen, last_moves
+        nonlocal failed_reads, last_fen, last_result
         while not stop.is_set():
             try:
                 fen = vision.screenshot_to_fen()
@@ -87,38 +88,50 @@ def _start_loop(overlay, vision, engine, config):
                     if analysis_fen.split(" ")[0] == empty_board_fen:
                         print("[Main] Empty board detected — skipping analysis.")
                         failed_reads += 1
-                        overlay.update_moves_signal.emit([], analysis_fen, debug)
+                        overlay.update_moves_signal.emit([], analysis_fen, debug, False, "Empty board")
                         stop.wait(timeout=config.refresh_interval_seconds)
                         continue
-
-                    if analysis_fen == last_fen:
+                    
+                    current_smart_mode = getattr(config, "smart_mode", True)
+                    
+                    if analysis_fen == last_fen and last_result is not None:
                         print("[Main] Position unchanged — reusing last analysis.")
-                        overlay.update_moves_signal.emit(last_moves, analysis_fen, debug)
+                        overlay.update_moves_signal.emit(
+                            last_result.moves, analysis_fen, debug,
+                            last_result.suppressed, last_result.reason,
+                        )
                         stop.wait(timeout=config.refresh_interval_seconds)
                         continue
-
+                    
+                    last_smart_mode = current_smart_mode
                     failed_reads = 0
-                    moves = engine.get_top_moves(analysis_fen)
-                    if moves:
-                        last_fen = analysis_fen
-                        last_moves = moves
-                        for m in moves:
+
+                    # ── Smart analysis ────────────────────────────────────
+                    result = engine.get_smart_moves(analysis_fen)
+                    last_fen = analysis_fen
+                    last_result = result
+
+                    if result.moves:
+                        print(f"[Main] {result.reason}")
+                        for m in result.moves:
                             print(f"  #{m.rank}  {m.san:8} {m.score_display}")
-                        overlay.update_moves_signal.emit(moves, analysis_fen, debug)
                     else:
-                        print("[Main] No moves — game over or position unreadable.")
-                        overlay.update_moves_signal.emit([], analysis_fen, debug)
-                        if getattr(engine, "last_call_had_restart", False):
-                            print("[Main] Stockfish restarted, will rescan this position on next cycle.")
-                            last_fen = None
-                            last_moves = []
-                        else:
-                            last_fen = analysis_fen
-                            last_moves = []
+                        print(f"[Main] Suppressed: {result.reason}")
+
+                    overlay.update_moves_signal.emit(
+                        result.moves, analysis_fen, debug,
+                        result.suppressed, result.reason,
+                    )
+
+                    if getattr(engine, "last_call_had_restart", False):
+                        print("[Main] Stockfish restarted — will rescan on next cycle.")
+                        last_fen = None
+                        last_result = None
+
                 else:
                     print("[Main] Could not read board from page.")
                     failed_reads += 1
-                    overlay.update_moves_signal.emit([], "", debug)
+                    overlay.update_moves_signal.emit([], "", debug, False, "")
 
                 if failed_reads >= 3:
                     rect = vision.get_board_rect_from_page()
@@ -127,7 +140,8 @@ def _start_loop(overlay, vision, engine, config):
                             print(f"[Main] Auto-updated scan region to {rect}")
                             config.board_rect = rect
                     failed_reads = 0
-            except Exception as e:
+
+            except Exception:
                 import traceback
                 traceback.print_exc()
 

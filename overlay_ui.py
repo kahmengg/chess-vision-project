@@ -6,7 +6,7 @@ from typing import List, Tuple
 from PyQt6.QtCore import Qt, QRect, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (QWidget, QApplication, QPushButton,
-                              QLabel, QVBoxLayout, QHBoxLayout)
+                              QLabel, QVBoxLayout)
 from config import Config
 
 FILES = "abcdefgh"
@@ -25,12 +25,15 @@ def sq_screen(name: str, flipped: bool = False) -> Tuple[int, int]:
 
 
 class ChessOverlayWindow(QWidget):
-    update_moves_signal = pyqtSignal(list, str, dict)
+    # Emits (moves, fen, debug, suppressed, reason)
+    update_moves_signal = pyqtSignal(list, str, dict, bool, str)
 
     def __init__(self, config: Config, parent=None):
         super().__init__(parent)
         self.config = config
         self._moves = []
+        self._suppressed = False
+        self._reason = ""
         self._last_debug = {}
         self._quit_shortcut = None
         self._setup_overlay()
@@ -59,11 +62,16 @@ class ChessOverlayWindow(QWidget):
             QWidget { background: rgba(15,15,15,225); border-radius: 10px; }
             QLabel  { color: #aaffaa; font-size: 12px;
                       padding: 8px 12px 2px 12px; }
+            QLabel#status_free  { color: #88ddaa; font-size: 11px; padding: 4px 12px; }
+            QLabel#status_alert { color: #ffdd55; font-size: 11px; padding: 4px 12px; }
+            QLabel#status_mate  { color: #ff5555; font-size: 11px; padding: 4px 12px; }
             QPushButton {
                 background: #2a2a2a; color: #ccc; font-size: 11px;
                 border: 1px solid #444; border-radius: 4px; padding: 4px 8px;
+                margin: 2px 10px;
             }
             QPushButton:hover { background: #3a3a3a; }
+            QPushButton:checked { background: #1a3a1a; border-color: #44aa44; color: #aaffaa; }
             #quit {
                 background: #7a1a1a; color: white; font-weight: bold;
                 font-size: 12px; border-color: #aa2222;
@@ -75,17 +83,30 @@ class ChessOverlayWindow(QWidget):
 
         layout = QVBoxLayout(self._panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(2)
 
         self._label = QLabel("♟  Chess Overlay\nAnalysing...")
         self._label.setWordWrap(True)
         layout.addWidget(self._label)
 
-        self._side_btn = QPushButton("Side: Auto")
-        self._side_btn.clicked.connect(self._cycle_side)
-        self._side_btn.setText(
+        # Smart mode status line
+        self._status_label = QLabel("")
+        self._status_label.setObjectName("status_free")
+        self._status_label.setWordWrap(True)
+        layout.addWidget(self._status_label)
+
+        # Smart mode toggle button
+        self._smart_btn = QPushButton("🧠  Smart Mode: ON")
+        self._smart_btn.setCheckable(True)
+        self._smart_btn.setChecked(getattr(self.config, "smart_mode", True))
+        self._smart_btn.clicked.connect(self._toggle_smart_mode)
+        layout.addWidget(self._smart_btn)
+
+        # Side toggle
+        self._side_btn = QPushButton(
             f"Side: {getattr(self.config, 'active_color', 'auto').title()}"
         )
+        self._side_btn.clicked.connect(self._cycle_side)
         layout.addWidget(self._side_btn)
 
         quit_btn = QPushButton("✕  Quit Overlay")
@@ -97,36 +118,34 @@ class ChessOverlayWindow(QWidget):
         self._panel.move(20, 20)
 
     def _setup_shortcuts(self):
-        # ApplicationShortcut works across all windows in this app.
         self._quit_shortcut = QShortcut(QKeySequence("Q"), self)
         self._quit_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._quit_shortcut.activated.connect(QApplication.quit)
 
+    def _toggle_smart_mode(self, checked: bool):
+        self.config.smart_mode = checked
+        self._smart_btn.setText(f"🧠  Smart Mode: {'ON' if checked else 'OFF'}")
+
     def _cycle_side(self):
         current = getattr(self.config, "active_color", "auto")
-        next_mode = {
-            "auto": "white",
-            "white": "black",
-            "black": "auto",
-        }.get(current, "auto")
+        next_mode = {"auto": "white", "white": "black", "black": "auto"}.get(current, "auto")
         self.config.active_color = next_mode
         self._side_btn.setText(f"Side: {next_mode.title()}")
 
     def _board_flipped(self) -> bool:
         mode = getattr(self.config, "active_color", "auto")
-        if mode == "black":
-            return True
-        if mode == "white":
-            return False
-        return False
+        return mode == "black"
 
     def show(self):
         super().show()
         self._panel.show()
 
-    def _on_update(self, moves, fen, debug):
+    def _on_update(self, moves, fen, debug, suppressed, reason):
         self._moves = moves
+        self._suppressed = suppressed
+        self._reason = reason
         self._last_debug = debug or {}
+
         if self.config.board_rect:
             l, t, r, b = self.config.board_rect
             region = f"Scan: ({l},{t}) -> ({r},{b})"
@@ -134,25 +153,52 @@ class ChessOverlayWindow(QWidget):
             region = "Scan: board not selected"
 
         active_mode = getattr(self.config, "active_color", "auto")
-
-        status = self._last_debug.get("status", "-")
+        status    = self._last_debug.get("status", "-")
         raw_nodes = self._last_debug.get("raw_nodes", 0)
-        placed = self._last_debug.get("placed", 0)
-        message = self._last_debug.get("message", "")
-        debug_line = f"Vision: {status} | nodes={raw_nodes} | pieces={placed} | side={active_mode}"
+        placed    = self._last_debug.get("placed", 0)
+        message   = self._last_debug.get("message", "")
+        board_side = "flipped" if self._board_flipped() else "white-side"
+        debug_line = (
+            f"Vision: {status} | nodes={raw_nodes} | "
+            f"pieces={placed} | side={active_mode} | board={board_side}"
+        )
 
         if moves:
-            top = moves[0]
+            move_labels = ["🟢 Best", "🔵 2nd ", "🟡 3rd ", "🟠 4th ", "🟣 5th "]
+            lines = []
+            for i, m in enumerate(moves[:5]):
+                prefix = move_labels[i] if i < len(move_labels) else f"  #{m.rank}"
+                lines.append(f"{prefix}:  {m.san:6}  {m.score_display}")
+            lines += ["", region, debug_line, message]
+            self._label.setText("\n".join(lines))
+
+            # Status label — alert or mate colour
+            if "Mate" in reason or "mate" in reason:
+                self._status_label.setObjectName("status_mate")
+            else:
+                self._status_label.setObjectName("status_alert")
+            self._status_label.setText(reason)
+
+        elif suppressed:
             self._label.setText(
-                f"♟  Best move: {top.san}  {top.score_display}\n"
-                f"{region}\n{debug_line} | board={'flipped' if self._board_flipped() else 'white-side'}\n{message}"
+                f"♟  Chess Overlay\n{region}\n{debug_line}\n{message}"
             )
+            self._status_label.setObjectName("status_free")
+            self._status_label.setText(reason)
         else:
             self._label.setText(
                 f"♟  Waiting for readable position...\n"
-                f"{region}\n{debug_line} | board={'flipped' if self._board_flipped() else 'white-side'}\n{message}"
+                f"{region}\n{debug_line}\n{message}"
             )
+            self._status_label.setText("")
+
+        # Force style refresh after objectName change
+        self._status_label.style().unpolish(self._status_label)
+        self._status_label.style().polish(self._status_label)
+
         self.update()
+
+    # ── Painting ──────────────────────────────────────────────────────────
 
     def paintEvent(self, event):
         if not self.config.board_rect:
@@ -165,57 +211,74 @@ class ChessOverlayWindow(QWidget):
         cw = (right - left) / 8
         ch = (bottom - top) / 8
 
-        # Always show the active scan area and 8x8 grid for visibility.
+        # ── Scan-region border + grid ──────────────────────────────────────
         painter.setPen(QPen(QColor(70, 180, 255, 210), 3, Qt.PenStyle.DashLine))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(int(left), int(top), int(right - left), int(bottom - top), 8, 8)
-
+        painter.drawRoundedRect(
+            int(left), int(top), int(right - left), int(bottom - top), 8, 8
+        )
         painter.setPen(QPen(QColor(70, 180, 255, 120), 1))
         for i in range(1, 8):
             x = int(left + i * cw)
-            y = int(top + i * ch)
-            painter.drawLine(x, int(top), x, int(bottom))
-            painter.drawLine(int(left), y, int(right), y)
+            y = int(top  + i * ch)
+            painter.drawLine(x, int(top),  x, int(bottom))
+            painter.drawLine(int(left), y, int(right),  y)
 
         if not self._moves:
             painter.end()
             return
 
-        if not self._moves:
-            painter.end()
-            return
-
-        move = self._moves[0]
-        color = QColor(*self.config.color_best)
+        # ── Move colours ──────────────────────────────────────────────────
+        color_defs = [
+            getattr(self.config, "color_best",   (100, 220, 100, 200)),
+            getattr(self.config, "color_second",  (100, 180, 255, 170)),
+            getattr(self.config, "color_third",   (255, 200,  80, 150)),
+            getattr(self.config, "color_fourth",  (255, 120,  80, 130)),
+            getattr(self.config, "color_fifth",   (200,  80, 255, 120)),
+        ]
+        move_labels = ["Best", "2nd", "3rd", "4th", "5th"]
         flipped = self._board_flipped()
-        fc, fr = sq_screen(move.from_square, flipped)
-        tc, tr = sq_screen(move.to_square, flipped)
-        fx, fy = int(left + fc * cw), int(top + fr * ch)
-        tx, ty = int(left + tc * cw), int(top + tr * ch)
 
-        # From square — dotted outline
-        painter.setPen(QPen(color.lighter(170), 3,
-                            Qt.PenStyle.DashLine))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(fx+3, fy+3, int(cw)-6, int(ch)-6, 4, 4)
+        for i, move in enumerate(self._moves[:5]):
+            color = QColor(*color_defs[i])
+            label_text = move_labels[i] if i < len(move_labels) else f"#{move.rank}"
 
-        # Arrow line
-        painter.setPen(QPen(color, 4))
-        painter.drawLine(fx+int(cw/2), fy+int(ch/2),
-                         tx+int(cw/2), ty+int(ch/2))
+            fc, fr = sq_screen(move.from_square, flipped)
+            tc, tr = sq_screen(move.to_square,   flipped)
+            fx = int(left + fc * cw)
+            fy = int(top  + fr * ch)
+            tx = int(left + tc * cw)
+            ty = int(top  + tr * ch)
 
-        # To square — filled
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(color))
-        painter.drawRoundedRect(tx+1, ty+1, int(cw)-2, int(ch)-2, 6, 6)
+            # From square — dashed outline
+            painter.setPen(QPen(color.lighter(170), 3, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(fx + 3, fy + 3, int(cw) - 6, int(ch) - 6, 4, 4)
 
-        # Label
-        label = f"Best: {move.san}\n{move.score_display}"
-        painter.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
-        painter.setPen(QColor(0, 0, 0, 210))
-        painter.drawText(QRect(tx+3, ty+3, int(cw), int(ch)),
-                         Qt.AlignmentFlag.AlignCenter, label)
-        painter.setPen(QColor(255, 255, 255, 240))
-        painter.drawText(QRect(tx+1, ty+1, int(cw), int(ch)),
-                         Qt.AlignmentFlag.AlignCenter, label)
+            # Arrow shaft
+            painter.setPen(QPen(color, 4))
+            painter.drawLine(
+                fx + int(cw / 2), fy + int(ch / 2),
+                tx + int(cw / 2), ty + int(ch / 2),
+            )
+
+            # To square — filled block
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(color))
+            painter.drawRoundedRect(tx + 1, ty + 1, int(cw) - 2, int(ch) - 2, 6, 6)
+
+            # Label — shadow then highlight
+            label = f"{label_text}: {move.san}\n{move.score_display}"
+            painter.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+            painter.setPen(QColor(0, 0, 0, 210))
+            painter.drawText(
+                QRect(tx + 3, ty + 3, int(cw), int(ch)),
+                Qt.AlignmentFlag.AlignCenter, label,
+            )
+            painter.setPen(QColor(255, 255, 255, 240))
+            painter.drawText(
+                QRect(tx + 1, ty + 1, int(cw), int(ch)),
+                Qt.AlignmentFlag.AlignCenter, label,
+            )
+
         painter.end()

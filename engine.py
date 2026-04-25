@@ -1,17 +1,17 @@
 """
 engine.py — Local Stockfish Integration
 ============================================================
-Sends a FEN to a local Stockfish binary and gets back the best move.
+Smart filtering logic to avoid always playing the best move:
 
-Free and unlimited, as long as the Stockfish executable is present.
+  - Suppress suggestion if you're clearly winning (eval > winning_threshold)
+  - Only show a move if move #1 is dramatically better than move #2
+    (gap >= critical_gap). These are "only move" tactical moments.
+  - Always show if there's a mate sequence on either side.
 """
 from __future__ import annotations
 
 import atexit
 import os
-import json
-import urllib.request
-import urllib.error
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -26,11 +26,11 @@ DEFAULT_STOCKFISH = "stockfish-windows-x86-64-avx2.exe"
 @dataclass
 class MoveEvaluation:
     rank: int
-    san: str           # e.g. "e4"
-    uci: str           # e.g. "e2e4"
-    from_square: str   # e.g. "e2"
-    to_square: str     # e.g. "e4"
-    eval_score: Optional[float]
+    san: str
+    uci: str
+    from_square: str
+    to_square: str
+    eval_score: Optional[float]   # centipawns, from current player's POV
     win_chance: Optional[float]
     mate: Optional[int]
 
@@ -39,9 +39,17 @@ class MoveEvaluation:
         if self.mate is not None:
             return f"M{self.mate}"
         if self.eval_score is not None:
-            sign = "+" if self.eval_score >= 0 else ""
-            return f"{sign}{self.eval_score:.2f}"
+            pawns = self.eval_score / 100
+            sign = "+" if pawns >= 0 else ""
+            return f"{sign}{pawns:.2f}"
         return "?"
+
+
+@dataclass
+class FilterResult:
+    moves: List[MoveEvaluation]   # moves to show (empty = play freely)
+    suppressed: bool              # True = filter decided to hide suggestion
+    reason: str                   # shown in the overlay panel
 
 
 class ChessEngine:
@@ -64,7 +72,6 @@ class ChessEngine:
             raise FileNotFoundError(
                 f"Local Stockfish binary not found: {self._engine_path}"
             )
-
         self._engine = chess.engine.SimpleEngine.popen_uci(self._engine_path)
         print(f"[Engine] Local Stockfish connected OK: {self._engine_path}")
 
@@ -80,38 +87,48 @@ class ChessEngine:
         self.close()
         self._start_engine()
 
+    # ── Raw analysis ──────────────────────────────────────────────────────
+
     def get_top_moves(self, fen: str) -> List[MoveEvaluation]:
-        """
-        Analyse the FEN locally and return the best move.
-        """
+        """Return raw top N moves with no filtering."""
         self.last_call_had_restart = False
         if self._engine is None:
             return []
 
         board = chess.Board(fen)
+        num_moves = getattr(self.config, "num_moves", 3)
 
         for attempt in range(2):
             try:
-                info = self._engine.analyse(board, chess.engine.Limit(depth=self.config.depth))
-                pv = info.get("pv") or []
-                if not pv:
-                    return []
+                info_list = self._engine.analyse(
+                    board,
+                    chess.engine.Limit(depth=self.config.depth),
+                    multipv=num_moves,
+                )
+                if isinstance(info_list, dict):
+                    info_list = [info_list]
 
-                move = pv[0]
-                score = info["score"].pov(board.turn)
-                mate = score.mate()
-                eval_score = score.score(mate_score=100000)
+                results: List[MoveEvaluation] = []
+                for rank, info in enumerate(info_list, start=1):
+                    pv = info.get("pv") or []
+                    if not pv:
+                        continue
+                    move = pv[0]
+                    score = info["score"].pov(board.turn)
+                    mate = score.mate()
+                    eval_score = score.score(mate_score=100000)
+                    results.append(MoveEvaluation(
+                        rank=rank,
+                        san=board.san(move),
+                        uci=move.uci(),
+                        from_square=chess.square_name(move.from_square),
+                        to_square=chess.square_name(move.to_square),
+                        eval_score=float(eval_score) if eval_score is not None else None,
+                        win_chance=None,
+                        mate=int(mate) if mate is not None else None,
+                    ))
+                return results
 
-                return [MoveEvaluation(
-                    rank=1,
-                    san=board.san(move),
-                    uci=move.uci(),
-                    from_square=chess.square_name(move.from_square),
-                    to_square=chess.square_name(move.to_square),
-                    eval_score=float(eval_score) if eval_score is not None else None,
-                    win_chance=None,
-                    mate=int(mate) if mate is not None else None,
-                )]
             except Exception as e:
                 print(f"[Engine] Local Stockfish error: {e}")
                 if attempt == 0:
@@ -123,56 +140,109 @@ class ChessEngine:
                         print(f"[Engine] Stockfish restart failed: {restart_error}")
                         return []
                 else:
-                    print("[Engine] Stockfish still crashing. The executable may be incompatible with this CPU.")
+                    print("[Engine] Stockfish still crashing. May be incompatible with this CPU.")
                     return []
 
         return []
 
-    def _parse_post_payload(self, data) -> List[MoveEvaluation]:
-        # Response can be a single dict or a list of dicts (one per variant)
-        if isinstance(data, dict):
-            data = [data]
+    # ── Smart filtering ───────────────────────────────────────────────────
 
-        moves: List[MoveEvaluation] = []
-        for rank, item in enumerate(data, start=1):
-            if item.get("type") not in ("move", "bestmove", None):
-                continue
-            mv = self._item_to_move(item, rank)
-            if mv:
-                moves.append(mv)
+    def get_smart_moves(self, fen: str) -> FilterResult:
+        moves = self.get_top_moves(fen)
+        if not moves:
+            return FilterResult(moves=[], suppressed=False, reason="No moves")
 
-        return moves
+        smart_mode = getattr(self.config, "smart_mode", True)
+        if not smart_mode:
+            return FilterResult(moves=moves, suppressed=False, reason="Smart mode off")
 
-    def _item_to_move(self, item: dict, rank: int) -> Optional[MoveEvaluation]:
-        from_sq = item.get("from", "")
-        to_sq = item.get("to", "")
-        san = item.get("san", item.get("move", "?"))
-        uci = item.get("lan", item.get("move", ""))
-        ev = item.get("eval")
-        wc = item.get("winChance")
-        mate = item.get("mate")
+        winning_threshold = getattr(self.config, "winning_threshold", 200)
+        critical_gap      = getattr(self.config, "critical_gap",      80)
 
-        if not from_sq or not to_sq:
-            return None
+        best = moves[0]
 
-        return MoveEvaluation(
-            rank=rank,
-            san=san,
-            uci=uci,
-            from_square=from_sq,
-            to_square=to_sq,
-            eval_score=float(ev) if ev is not None else None,
-            win_chance=float(wc) if wc is not None else None,
-            mate=int(mate) if mate is not None else None,
+        # ── 1. MATE CHECK ─────────────────────────────────────────────────
+        if best.mate is not None:
+            label = "for you" if best.mate > 0 else "against you — defend!"
+            return FilterResult(
+                moves=[best],
+                suppressed=False,
+                reason=f"⚠ Mate in {abs(best.mate)} {label}",
+            )
+
+        # ── 2. DIRECT THREAT SCANNER (Protects Rooks, Queens, etc.) ───────
+        board = chess.Board(fen)
+        turn = board.turn
+        
+        # Standard chess piece values
+        piece_values = {
+            chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+            chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 100
+        }
+
+        under_severe_threat = False
+        threat_reason = ""
+
+        # Check every piece you currently have on the board
+        for square, piece in board.piece_map().items():
+            if piece.color == turn:
+                attackers = board.attackers(not turn, square)
+                
+                # If an opponent's piece is attacking this square
+                if attackers:
+                    defenders = board.attackers(turn, square)
+                    piece_val = piece_values.get(piece.piece_type, 0)
+                    
+                    # Find the lowest value piece attacking you
+                    min_attacker_val = min([piece_values.get(board.piece_at(sq).piece_type, 0) for sq in attackers])
+                    
+                    piece_name = chess.piece_name(piece.piece_type).title()
+
+                    # Threat A: Attacked by a lower-value piece (e.g., Bishop attacks Rook)
+                    if min_attacker_val < piece_val:
+                        under_severe_threat = True
+                        threat_reason = f"⚠ {piece_name} under attack!"
+                        break
+                        
+                    # Threat B: Attacked and completely undefended (Hanging for free)
+                    if not defenders:
+                        under_severe_threat = True
+                        threat_reason = f"⚠ Hanging {piece_name}!"
+                        break
+
+        # If a direct threat is found, bypass the gap logic and show the arrow immediately
+        if under_severe_threat:
+            return FilterResult(
+                moves=[best],
+                suppressed=False,
+                reason=threat_reason
+            )
+
+        # ── 3. TACTICAL GAP CHECK (Forks, blunders, only-moves) ───────────
+        best_cp = best.eval_score or 0
+        gap = 0
+        if len(moves) >= 2:
+            second_cp = moves[1].eval_score or 0
+            gap = best_cp - second_cp
+
+        if gap >= critical_gap:
+            return FilterResult(
+                moves=[best], 
+                suppressed=False, 
+                reason=f"⚡ Critical! Only move (gap +{gap/100:.1f})"
+            )
+
+        # ── 4. WINNING THRESHOLD (Safe and winning) ───────────────────────
+        if best_cp >= winning_threshold:
+            return FilterResult(
+                moves=[],
+                suppressed=True,
+                reason=f"You're winning (+{best_cp/100:.1f}) — play freely ✓",
+            )
+
+        # ── 5. EVEN GAME (Safe) ───────────────────────────────────────────
+        return FilterResult(
+            moves=[],
+            suppressed=True,
+            reason=f"Many safe moves (gap {gap/100:.1f}) — play freely ✓",
         )
-
-    def _post(self, payload: dict) -> any:
-        body = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            API_URL,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
