@@ -185,9 +185,9 @@ class VisionModule:
             var r = b.getBoundingClientRect();
             // Add window scroll offset to get screen coords
             return {
-                left:   Math.round(r.left   + window.screenX),
+                left:   Math.round(r.left   + window.screenX + 50 ),
                 top:    Math.round(r.top    + window.screenY + 90),
-                right:  Math.round(r.right  + window.screenX),
+                right:  Math.round(r.right  + window.screenX - 20),
                 bottom: Math.round(r.bottom + window.screenY + 90)
             };
         })()

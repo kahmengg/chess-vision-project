@@ -250,7 +250,7 @@ class ChessOverlayWindow(QWidget):
             tx = int(left + tc * cw)
             ty = int(top  + tr * ch)
 
-            # From square — dashed outline
+            # From square — dashed outline, no fill
             painter.setPen(QPen(color.lighter(170), 3, Qt.PenStyle.DashLine))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(fx + 3, fy + 3, int(cw) - 6, int(ch) - 6, 4, 4)
@@ -262,13 +262,15 @@ class ChessOverlayWindow(QWidget):
                 tx + int(cw / 2), ty + int(ch / 2),
             )
 
-            # To square — filled block
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(color))
-            painter.drawRoundedRect(tx + 1, ty + 1, int(cw) - 2, int(ch) - 2, 6, 6)
+            # To square — solid border + semi-transparent fill so piece stays visible
+            border_color = color.lighter(140)
+            fill_color = QColor(color.red(), color.green(), color.blue(), 60)  # ~24% opacity
+            painter.setPen(QPen(border_color, 3))
+            painter.setBrush(QBrush(fill_color))
+            painter.drawRoundedRect(tx + 2, ty + 2, int(cw) - 4, int(ch) - 4, 6, 6)
 
             # Label — shadow then highlight
-            label = f"{label_text}: {move.san}\n{move.score_display}"
+            label = f"{move.san}\n{move.score_display}"
             painter.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
             painter.setPen(QColor(0, 0, 0, 210))
             painter.drawText(

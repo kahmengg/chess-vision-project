@@ -11,7 +11,7 @@ class Config:
     # ── Stockfish ──────────────────────────────────────────────────────────
     stockfish_path: str = "stockfish-windows-x86-64-avx2.exe"
     depth: int = 15
-    num_moves: int = 5               # how many moves to fetch from Stockfish internally
+    num_moves: int = 4               # how many moves to fetch from Stockfish internally
 
     # ── Smart mode ────────────────────────────────────────────────────────
     # When True, only shows a move on critical "only move" tactical moments.

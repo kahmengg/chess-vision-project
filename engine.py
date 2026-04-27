@@ -146,7 +146,6 @@ class ChessEngine:
         return []
 
     # ── Smart filtering ───────────────────────────────────────────────────
-
     def get_smart_moves(self, fen: str) -> FilterResult:
         moves = self.get_top_moves(fen)
         if not moves:
@@ -160,12 +159,27 @@ class ChessEngine:
         critical_gap      = getattr(self.config, "critical_gap",      80)
 
         best = moves[0]
+        best_cp = best.eval_score or 0
+
+        # ── NEW: FILTER VIABLE OPTIONS ────────────────────────────────────
+        # Only keep alternative moves if they are within 100 centipawns (1 pawn) 
+        # of the absolute best move. This prevents arrows that blunder pieces.
+        viable_moves = []
+        for m in moves:
+            if best.mate is not None:
+                # If there's a forced mate, only show moves that also force mate
+                if m.mate is not None:
+                    viable_moves.append(m)
+            else:
+                m_cp = m.eval_score or -99999
+                if (best_cp - m_cp) <= 100:  
+                    viable_moves.append(m)
 
         # ── 1. MATE CHECK ─────────────────────────────────────────────────
         if best.mate is not None:
             label = "for you" if best.mate > 0 else "against you — defend!"
             return FilterResult(
-                moves=[best],
+                moves=viable_moves,  # <--- Now showing all viable options
                 suppressed=False,
                 reason=f"⚠ Mate in {abs(best.mate)} {label}",
             )
@@ -174,7 +188,6 @@ class ChessEngine:
         board = chess.Board(fen)
         turn = board.turn
         
-        # Standard chess piece values
         piece_values = {
             chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
             chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 100
@@ -183,43 +196,34 @@ class ChessEngine:
         under_severe_threat = False
         threat_reason = ""
 
-        # Check every piece you currently have on the board
         for square, piece in board.piece_map().items():
             if piece.color == turn:
                 attackers = board.attackers(not turn, square)
                 
-                # If an opponent's piece is attacking this square
                 if attackers:
                     defenders = board.attackers(turn, square)
                     piece_val = piece_values.get(piece.piece_type, 0)
-                    
-                    # Find the lowest value piece attacking you
                     min_attacker_val = min([piece_values.get(board.piece_at(sq).piece_type, 0) for sq in attackers])
-                    
                     piece_name = chess.piece_name(piece.piece_type).title()
 
-                    # Threat A: Attacked by a lower-value piece (e.g., Bishop attacks Rook)
                     if min_attacker_val < piece_val:
                         under_severe_threat = True
                         threat_reason = f"⚠ {piece_name} under attack!"
                         break
                         
-                    # Threat B: Attacked and completely undefended (Hanging for free)
                     if not defenders:
                         under_severe_threat = True
                         threat_reason = f"⚠ Hanging {piece_name}!"
                         break
 
-        # If a direct threat is found, bypass the gap logic and show the arrow immediately
         if under_severe_threat:
             return FilterResult(
-                moves=[best],
+                moves=viable_moves,  # <--- Now showing all viable options
                 suppressed=False,
                 reason=threat_reason
             )
 
         # ── 3. TACTICAL GAP CHECK (Forks, blunders, only-moves) ───────────
-        best_cp = best.eval_score or 0
         gap = 0
         if len(moves) >= 2:
             second_cp = moves[1].eval_score or 0
@@ -227,7 +231,7 @@ class ChessEngine:
 
         if gap >= critical_gap:
             return FilterResult(
-                moves=[best], 
+                moves=viable_moves,  # <--- Now showing all viable options
                 suppressed=False, 
                 reason=f"⚡ Critical! Only move (gap +{gap/100:.1f})"
             )

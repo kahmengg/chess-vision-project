@@ -60,10 +60,12 @@ def _start_loop(overlay, vision, engine, config):
     failed_reads = 0
     last_fen = None
     last_result = None   # FilterResult
-    last_smart_mode = getattr(config, "smart_mode", True)  # <--- 1. ADD THIS
+    last_smart_mode = getattr(config, "smart_mode", True)
 
     def worker():
-        nonlocal failed_reads, last_fen, last_result
+        # THIS is the line that needed fixing! 
+        nonlocal failed_reads, last_fen, last_result, last_smart_mode
+        
         while not stop.is_set():
             try:
                 fen = vision.screenshot_to_fen()
@@ -94,7 +96,8 @@ def _start_loop(overlay, vision, engine, config):
                     
                     current_smart_mode = getattr(config, "smart_mode", True)
                     
-                    if analysis_fen == last_fen and last_result is not None:
+                    # Check if fen is the same AND the smart mode hasn't been toggled
+                    if analysis_fen == last_fen and last_result is not None and current_smart_mode == last_smart_mode:
                         print("[Main] Position unchanged — reusing last analysis.")
                         overlay.update_moves_signal.emit(
                             last_result.moves, analysis_fen, debug,
@@ -103,6 +106,7 @@ def _start_loop(overlay, vision, engine, config):
                         stop.wait(timeout=config.refresh_interval_seconds)
                         continue
                     
+                    # Update the tracked mode so it knows we handled the toggle
                     last_smart_mode = current_smart_mode
                     failed_reads = 0
 
