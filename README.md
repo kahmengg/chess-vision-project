@@ -1,10 +1,10 @@
 # Chess Screen Overlay — Setup & Usage
 
 A modular Python desktop application that:
-1. **Captures** a selected region of your screen (the chess board)
-2. **Converts** the visual state to a FEN string via perceptual image hashing
-3. **Queries** a local Stockfish engine for the top 3 suggested moves
-4. **Displays** coloured highlights and annotations on a transparent overlay
+1. **Connects** to Chrome's DevTools Protocol (CDP) to read the chess.com board DOM directly
+2. **Converts** the live board state to a FEN string
+3. **Queries** a local Stockfish engine for the top moves with smart tactical filtering
+4. **Displays** coloured arrows and annotations on a transparent click-through overlay
 
 ---
 
@@ -20,11 +20,11 @@ pip install -r requirements.txt
 
 Download from **https://stockfishchess.org/download/**
 
+- **Windows**: Place `stockfish-windows-x86-64-avx2.exe` in the project root.
 - **Linux/macOS**: Place the `stockfish` binary in the project root, then:
   ```bash
   chmod +x stockfish
   ```
-- **Windows**: Place `stockfish.exe` in the project root.
 
 Alternatively, set `stockfish_path` in `config.py` to an absolute path.
 
@@ -36,28 +36,38 @@ Alternatively, set `stockfish_path` in `config.py` to an absolute path.
 chess_overlay/
 ├── main.py            # Entry point & analysis loop
 ├── config.py          # All tunable settings in one place
-├── vision.py          # Vision backend (screen capture → FEN)
-├── engine.py          # Stockfish UCI integration
+├── vision.py          # Vision backend (Chrome CDP → FEN)
+├── engine.py          # Stockfish UCI integration + smart filtering
 ├── overlay_ui.py      # Transparent click-through PyQt6 overlay
-├── board_selector.py  # Click-drag board region calibration
+├── board_selector.py  # Auto-detect or click-drag board region
 ├── requirements.txt
 └── README.md
 ```
 
 ---
 
-## First-Run Calibration (Board Region Only)
-
-### Step A: Board Region (automatic)
-When you launch the app, a full-screen dim overlay appears.
-**Click and drag** a rectangle around the chess board on your screen.
-Release the mouse — the overlay window will now track that region.
-
 ## Running
+
+### Step 1 — Open Chrome and go to chess.com
+Start or join a game. The app will auto-connect to your Chrome tab.
+
+> If Chrome is not already open, the app launches an isolated debug Chrome
+> profile automatically and opens chess.com for you.
+
+### Step 2 — Run the app
 
 ```bash
 python main.py
 ```
+
+### Step 3 — Board region
+The app attempts to **auto-detect** the board position from the page.
+If auto-detect fails, a full-screen dim overlay appears — **click and drag**
+a rectangle around the chess board and release.
+
+### Step 4 — Play
+Move suggestions appear automatically as arrows on the overlay.
+Press **Q** or click **✕ Quit Overlay** in the control panel to exit.
 
 ---
 
@@ -65,47 +75,57 @@ python main.py
 
 | Setting | Default | Description |
 |---|---|---|
-| `stockfish_path` | `./stockfish` | Path to Stockfish binary |
-| `stockfish_depth` | `15` | Analysis depth (higher = stronger/slower) |
-| `stockfish_multipv` | `3` | Number of top moves to fetch |
-| `refresh_interval_seconds` | `3.0` | Seconds between analysis cycles |
-| `active_color` | `"w"` | Whose turn: `"w"` or `"b"` |
-| `overlay_opacity` | `0.85` | Overlay transparency (0=invisible, 1=opaque) |
-| `vision_backend` | `"hash"` | Vision module: `"hash"` or your custom key |
+| `stockfish_path` | `stockfish-windows-x86-64-avx2.exe` | Path to Stockfish binary |
+| `depth` | `15` | Analysis depth (higher = stronger/slower) |
+| `num_moves` | `4` | Number of top moves to fetch from Stockfish |
+| `refresh_interval_seconds` | `1.5` | Seconds between analysis cycles |
+| `active_color` | `"auto"` | Side override: `"auto"` \| `"white"` \| `"black"` |
+| `smart_mode` | `True` | Only show moves on critical tactical moments |
+| `winning_threshold` | `200` | Suppress hints when you're ahead by this many centipawns |
+| `critical_gap` | `80` | Show hint only when best move is this much better than 2nd best |
 
 ---
 
-## Swapping the Vision Module
+## Smart Mode
 
-The vision layer is abstracted behind `VisionModuleBase`.
-To plug in a DOM scraper (e.g. for chess.com's live board):
+When **Smart Mode** is on (default), the overlay only suggests moves when there is a genuine tactical reason:
 
-```python
-# my_dom_vision.py
-from vision import VisionModuleBase
+| Trigger | Example reason shown |
+|---|---|
+| Forced mate sequence | `⚠ Mate in 3 for you` |
+| Piece under attack | `⚠ Queen under attack!` |
+| Hanging piece | `⚠ Hanging Rook!` |
+| Only move (large gap) | `⚡ Critical! Only move (gap +1.2)` |
+| You're clearly winning | Suppressed — `You're winning (+2.5) — play freely ✓` |
+| Even position, many good moves | Suppressed — `Many safe moves — play freely ✓` |
 
-class DomVisionModule(VisionModuleBase):
-    def capture(self, board_rect):
-        return None  # Not needed for DOM scraping
+Toggle Smart Mode on/off anytime from the control panel without restarting.
 
-    def screenshot_to_fen(self, screenshot):
-        # Use Selenium/Playwright to read the board DOM
-        # and return a FEN string
-        ...
-```
+---
 
-Then in `vision.py`, add to the `backends` dict:
-```python
-backends = {
-    "hash": HashVisionModule,
-    "dom":  DomVisionModule,   # ← add this
-}
-```
+## Overlay Controls
 
-And in `config.py`:
-```python
-vision_backend: str = "dom"
-```
+The control panel (top-left of screen) has:
+
+- **🧠 Smart Mode** — toggle tactical filtering on/off
+- **Side** — cycle between `Auto` / `White` / `Black` to override whose turn it is
+- **✕ Quit Overlay** — exit the app (or press **Q**)
+
+---
+
+## Overlay Colour Key
+
+| Colour | Meaning |
+|---|---|
+| 🟢 Green | Best move |
+| 🔵 Blue | 2nd best |
+| 🟡 Yellow | 3rd best |
+| 🟠 Orange | 4th best |
+| 🟣 Purple | 5th best |
+
+Each arrow shows the SAN move name and eval score (e.g. `Nf3 +0.45`).
+The **destination square** is highlighted with a semi-transparent tint and border
+so the piece underneath remains visible.
 
 ---
 
@@ -114,38 +134,40 @@ vision_backend: str = "dom"
 ```
 Background thread (daemon)
   └─ while True:
-       1. capture()              # ~5–15 ms
-       2. screenshot_to_fen()    # ~50–200 ms (hashing 64 cells)
-       3. get_top_moves()        # ~200–1000 ms (Stockfish at depth 15)
-       4. emit signal → Qt main thread
-       5. stop_event.wait(3.0)   # BLOCKS for 3 seconds — zero CPU
+       1. vision.screenshot_to_fen()   # reads chess.com DOM via CDP (~10 ms)
+       2. engine.get_smart_moves()     # Stockfish analysis (~200–1000 ms at depth 15)
+       3. emit signal → Qt main thread # updates overlay
+       4. stop_event.wait(1.5)         # BLOCKS for 1.5 s — zero CPU
 ```
 
 `threading.Event.wait(timeout)` releases the GIL and sleeps the OS thread.
-CPU usage between analysis cycles is effectively 0%.
+If the position hasn't changed, analysis is skipped entirely and the last
+result is reused — no redundant Stockfish calls.
 
 ---
 
-## Overlay Colour Key
+## How Vision Works (No Screen Capture Needed)
 
-| Colour | Meaning |
-|---|---|
-| 🟢 Green | #1 best move |
-| 🟡 Amber | #2 second-best |
-| 🔴 Red | #3 third-best |
+Unlike traditional overlays that take screenshots and run image recognition,
+this app reads the board **directly from the chess.com page HTML** via Chrome's
+DevTools Protocol (CDP):
 
-Each highlighted square shows: `#N SAN_move\nScore` (e.g. `#1 e4\n+0.35`)
+- Piece positions are encoded as CSS classes on DOM elements (e.g. `piece wp square-45`)
+- The app connects to Chrome's debug port (`localhost:9222`) and runs a small
+  JavaScript snippet to extract all piece/square pairs
+- This is faster, more accurate, and works at any screen resolution or zoom level
+- No Selenium or special Chrome launch flags required for normal use —
+  the app opens its own isolated debug Chrome profile if needed
 
 ---
 
 ## ⚠️ Fair Play Notice
 
 This tool is designed for:
-- Analysing **grandmaster games** from databases offline
+- Analysing **your own past games** for study and review
 - Training against **computer bots** in local engines
-- **Study and learning** in non-competitive contexts
+- **Learning and improvement** in non-competitive contexts
 
 Using real-time engine assistance during **rated online games** violates the
-Terms of Service of every major chess platform (chess.com, Lichess, Chess24, etc.)
-and is considered cheating. Several platforms use transparency-layer detection
-heuristics in their fair-play systems.
+Terms of Service of every major chess platform (chess.com, Lichess, Chess24 etc.)
+and is considered cheating. Please use responsibly.
