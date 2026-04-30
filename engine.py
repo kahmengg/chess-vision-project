@@ -161,33 +161,53 @@ class ChessEngine:
         best = moves[0]
         best_cp = best.eval_score or 0
 
-        # ── NEW: FILTER VIABLE OPTIONS ────────────────────────────────────
-        # Only keep alternative moves if they are within 100 centipawns (1 pawn) 
-        # of the absolute best move. This prevents arrows that blunder pieces.
+        board = chess.Board(fen)
+        turn  = board.turn
+
+        # ── VIABLE MOVES FILTER ───────────────────────────────────────────
+        # Only keep moves within 100cp of best, or all mate moves if mate exists
         viable_moves = []
         for m in moves:
             if best.mate is not None:
-                # If there's a forced mate, only show moves that also force mate
                 if m.mate is not None:
                     viable_moves.append(m)
             else:
                 m_cp = m.eval_score or -99999
-                if (best_cp - m_cp) <= 100:  
+                if (best_cp - m_cp) <= 100:
                     viable_moves.append(m)
 
-        # ── 1. MATE CHECK ─────────────────────────────────────────────────
+        # ── 1. CHECK / MATE ───────────────────────────────────────────────
+        # Handle check FIRST — overrides everything else.
+        # If in check, the threat scanner must not run (moves are forced).
+        if board.is_check():
+            if best.mate is not None:
+                # Checkmate unavoidable
+                label = "for you" if best.mate > 0 else "against you — defend!"
+                return FilterResult(
+                    moves=viable_moves,
+                    suppressed=False,
+                    reason=f"⚠ Mate in {abs(best.mate)} {label}",
+                )
+            # In check but not mate — must escape, always show the move
+            return FilterResult(
+                moves=viable_moves,
+                suppressed=False,
+                reason="⚠ You're in check!",
+            )
+
+        # Not in check — safe to run mate check on best move
         if best.mate is not None:
             label = "for you" if best.mate > 0 else "against you — defend!"
             return FilterResult(
-                moves=viable_moves,  # <--- Now showing all viable options
+                moves=viable_moves,
                 suppressed=False,
                 reason=f"⚠ Mate in {abs(best.mate)} {label}",
             )
 
-        # ── 2. DIRECT THREAT SCANNER (Protects Rooks, Queens, etc.) ───────
-        board = chess.Board(fen)
-        turn = board.turn
-        
+        # ── 2. DIRECT THREAT SCANNER ──────────────────────────────────────
+        # Only scan YOUR pieces (turn == board.turn).
+        # Skip kings — check is already handled above.
+        # Also verify the suggested escape move is legal before firing.
         piece_values = {
             chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
             chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 100
@@ -197,33 +217,49 @@ class ChessEngine:
         threat_reason = ""
 
         for square, piece in board.piece_map().items():
-            if piece.color == turn:
-                attackers = board.attackers(not turn, square)
-                
-                if attackers:
-                    defenders = board.attackers(turn, square)
-                    piece_val = piece_values.get(piece.piece_type, 0)
-                    min_attacker_val = min([piece_values.get(board.piece_at(sq).piece_type, 0) for sq in attackers])
-                    piece_name = chess.piece_name(piece.piece_type).title()
+            # Only care about our own pieces, skip king (handled by check logic)
+            if piece.color != turn:
+                continue
+            if piece.piece_type == chess.KING:
+                continue
 
-                    if min_attacker_val < piece_val:
-                        under_severe_threat = True
-                        threat_reason = f"⚠ {piece_name} under attack!"
-                        break
-                        
-                    if not defenders:
-                        under_severe_threat = True
-                        threat_reason = f"⚠ Hanging {piece_name}!"
-                        break
+            attackers = board.attackers(not turn, square)
+            if not attackers:
+                continue
+
+            defenders  = board.attackers(turn, square)
+            piece_val  = piece_values.get(piece.piece_type, 0)
+            min_atk_val = min(
+                piece_values.get(board.piece_at(sq).piece_type, 0)
+                for sq in attackers
+            )
+            piece_name = chess.piece_name(piece.piece_type).title()
+
+            # Attacked by a cheaper piece — clearly losing the trade
+            if min_atk_val < piece_val:
+                under_severe_threat = True
+                threat_reason = f"⚠ {piece_name} under attack!"
+                break
+
+            # Completely undefended and attacked
+            if not defenders:
+                under_severe_threat = True
+                threat_reason = f"⚠ Hanging {piece_name}!"
+                break
 
         if under_severe_threat:
-            return FilterResult(
-                moves=viable_moves,  # <--- Now showing all viable options
-                suppressed=False,
-                reason=threat_reason
-            )
+            # Sanity check: make sure the best suggested move is actually legal
+            # (edge case: threat detected but only legal moves don't address it)
+            best_move = chess.Move.from_uci(best.uci)
+            if best_move in board.legal_moves:
+                return FilterResult(
+                    moves=viable_moves,
+                    suppressed=False,
+                    reason=threat_reason,
+                )
+            # Best move is somehow illegal — fall through to gap check
 
-        # ── 3. TACTICAL GAP CHECK (Forks, blunders, only-moves) ───────────
+        # ── 3. TACTICAL GAP CHECK ─────────────────────────────────────────
         gap = 0
         if len(moves) >= 2:
             second_cp = moves[1].eval_score or 0
@@ -231,12 +267,12 @@ class ChessEngine:
 
         if gap >= critical_gap:
             return FilterResult(
-                moves=viable_moves,  # <--- Now showing all viable options
-                suppressed=False, 
-                reason=f"⚡ Critical! Only move (gap +{gap/100:.1f})"
+                moves=viable_moves,
+                suppressed=False,
+                reason=f"⚡ Critical! Only move (gap +{gap/100:.1f})",
             )
 
-        # ── 4. WINNING THRESHOLD (Safe and winning) ───────────────────────
+        # ── 4. WINNING THRESHOLD ──────────────────────────────────────────
         if best_cp >= winning_threshold:
             return FilterResult(
                 moves=[],
@@ -244,7 +280,7 @@ class ChessEngine:
                 reason=f"You're winning (+{best_cp/100:.1f}) — play freely ✓",
             )
 
-        # ── 5. EVEN GAME (Safe) ───────────────────────────────────────────
+        # ── 5. EVEN GAME ──────────────────────────────────────────────────
         return FilterResult(
             moves=[],
             suppressed=True,
