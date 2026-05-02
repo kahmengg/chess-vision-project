@@ -29,7 +29,7 @@ class Config:
 
     # ── Vision / scanning ─────────────────────────────────────────────────
     board_rect: Optional[Tuple[int, int, int, int]] = None
-    refresh_interval_seconds: float = 1.5
+    refresh_interval_seconds: float = 0.5
 
     # ── Side override ──────────────────────────────────────────────────────
     active_color: str = "auto"       # "auto" | "white" | "black"

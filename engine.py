@@ -155,8 +155,8 @@ class ChessEngine:
         if not smart_mode:
             return FilterResult(moves=moves, suppressed=False, reason="Smart mode off")
 
-        winning_threshold = getattr(self.config, "winning_threshold", 200)
-        critical_gap      = getattr(self.config, "critical_gap",      80)
+        winning_threshold = getattr(self.config, "winning_threshold", 250)
+        critical_gap      = getattr(self.config, "critical_gap",      20)
 
         best = moves[0]
         best_cp = best.eval_score or 0
