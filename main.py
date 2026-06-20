@@ -39,7 +39,7 @@ def main():
         print("Fix: Open Chrome and chess.com (or let the app launch it), then run main.py again.")
         sys.exit(1)
 
-    overlay = ChessOverlayWindow(config)
+    overlay = ChessOverlayWindow(config, engine=engine)
     selector = BoardSelectorWindow(config, vision=vision)
 
     def on_board_selected(rect):
