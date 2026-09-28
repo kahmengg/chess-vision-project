@@ -1,0 +1,11 @@
+{
+  "stockfish_path": "stockfish-windows-x86-64-avx2.exe",
+  "depth": 15,
+  "analysis_time_seconds": 0.35,
+  "analysis_cache_size": 128,
+  "num_moves": 4,
+  "refresh_interval_seconds": 0.5,
+  "smart_mode": true,
+  "study_mode": true,
+  "allow_live_assistance": false
+}

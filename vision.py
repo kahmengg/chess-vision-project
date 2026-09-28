@@ -26,6 +26,8 @@ import sys
 import os
 import tempfile
 
+import chess
+
 from config import Config
 
 PIECE_MAP = {
@@ -47,6 +49,7 @@ class VisionModule:
     def __init__(self, config: Config):
         self.config = config
         self._tab_ws_url = None
+        self._last_board: Optional[chess.Board] = None
         self._last_debug: Dict[str, Any] = {
             "status": "init",
             "raw_nodes": 0,
@@ -60,6 +63,11 @@ class VisionModule:
 
     def _set_debug(self, **kwargs):
         self._last_debug.update(kwargs)
+
+    def get_current_url(self) -> str:
+        """Return the current tab URL when Chrome is reachable."""
+        result = self._run_js("window.location.href")
+        return result if isinstance(result, str) else ""
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
@@ -178,17 +186,34 @@ class VisionModule:
         """Get the board element's screen coordinates from the page."""
         js = """
         (function() {
-            var b = document.querySelector('chess-board') ||
-                    document.querySelector('.board-layout-chessboard') ||
-                    document.querySelector('.board');
+            function visibleBoard(el) {
+                if (!el || !el.getBoundingClientRect) return false;
+                var r = el.getBoundingClientRect();
+                var s = window.getComputedStyle(el);
+                return r.width > 100 && r.height > 100 &&
+                       Math.abs(r.width - r.height) < 8 &&
+                       s.display !== 'none' && s.visibility !== 'hidden';
+            }
+            var candidates = Array.prototype.slice.call(document.querySelectorAll(
+                'wc-chess-board, chess-board, .board-layout-chessboard, .board'
+            )).filter(visibleBoard);
+            candidates.sort(function(a, b) {
+                // The actual board is normally the smallest square wrapper.
+                var ar = a.getBoundingClientRect(), br = b.getBoundingClientRect();
+                return (ar.width * ar.height) - (br.width * br.height);
+            });
+            var b = candidates[0];
             if (!b) return null;
             var r = b.getBoundingClientRect();
-            // Add window scroll offset to get screen coords
+            // DOM rects are viewport-relative. Account for the browser frame
+            // without shrinking the board or relying on fixed toolbar offsets.
+            var frameX = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+            var frameY = Math.max(0, window.outerHeight - window.innerHeight - frameX);
             return {
-                left:   Math.round(r.left   + window.screenX + 40 ),
-                top:    Math.round(r.top    + window.screenY + 90),
-                right:  Math.round(r.right  + window.screenX - 20),
-                bottom: Math.round(r.bottom + window.screenY + 90)
+                left:   Math.round(r.left   + window.screenX + frameX),
+                top:    Math.round(r.top    + window.screenY + frameY),
+                right:  Math.round(r.right  + window.screenX + frameX),
+                bottom: Math.round(r.bottom + window.screenY + frameY)
             };
         })()
         """
@@ -285,37 +310,46 @@ class VisionModule:
                 return wordsToFen(text);
             }
 
-            function collectRoots(root, out) {
-                out.push(root);
+            function isVisible(el) {
+                if (!el || !el.getBoundingClientRect) return false;
+                var rect = el.getBoundingClientRect();
+                var style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                       style.display !== 'none' && style.visibility !== 'hidden';
+            }
+
+            function boardCandidates(root) {
+                var selectors = 'wc-chess-board, chess-board, .board-layout-chessboard, .board';
+                var nodes = Array.prototype.slice.call(root.querySelectorAll(selectors));
                 var all = root.querySelectorAll('*');
                 for (var i = 0; i < all.length; i++) {
-                    if (all[i].shadowRoot) collectRoots(all[i].shadowRoot, out);
+                    if (all[i].shadowRoot) nodes = nodes.concat(boardCandidates(all[i].shadowRoot));
                 }
+                return nodes.filter(function(el) {
+                    if (!isVisible(el)) return false;
+                    var rect = el.getBoundingClientRect();
+                    return rect.width > 100 && rect.height > 100 &&
+                           Math.abs(rect.width - rect.height) < 8;
+                });
             }
 
-            function collectBoardRoots(root) {
-                var selectors = 'chess-board, .board-layout-chessboard, .board, [class*="board"]';
-                var nodes = [];
-                try {
-                    nodes = Array.prototype.slice.call(root.querySelectorAll(selectors));
-                } catch (e) {
-                    nodes = [];
-                }
-                return nodes;
-            }
-
-            var roots = collectBoardRoots(document);
-            if (!roots.length) {
-                collectRoots(document, roots);
-            }
+            var roots = boardCandidates(document);
+            roots.sort(function(a, b) {
+                var ac = a.querySelectorAll('.piece, [data-piece]').length;
+                var bc = b.querySelectorAll('.piece, [data-piece]').length;
+                if (ac !== bc) return bc - ac;
+                var ar = a.getBoundingClientRect(), br = b.getBoundingClientRect();
+                return (ar.width * ar.height) - (br.width * br.height);
+            });
+            var boardRoot = roots.length ? roots[0] : null;
+            if (!boardRoot) return null;
 
             var placements = {};
             var rawNodes = 0;
-
-            for (var r = 0; r < roots.length; r++) {
-                var nodes = roots[r].querySelectorAll('.piece, [data-piece], [data-square], [class*="piece"], [class*="square-"]');
-                for (var i = 0; i < nodes.length; i++) {
+            var nodes = boardRoot.querySelectorAll('.piece, [data-piece], [data-square], [class*="piece"], [class*="square-"]');
+            for (var i = 0; i < nodes.length; i++) {
                     var n = nodes[i];
+                    if (!isVisible(n)) continue;
                     rawNodes += 1;
 
                     var cls = (typeof n.className === 'string') ? n.className : '';
@@ -340,7 +374,87 @@ class VisionModule:
 
                     var key = String(sq.f) + ',' + String(sq.r);
                     placements[key] = piece;
+            }
+
+            function readOrientation() {
+                var text = '';
+                var el = boardRoot;
+                for (var depth = 0; el && depth < 3; depth++, el = el.parentElement) {
+                    text += ' ' + (typeof el.className === 'string' ? el.className : '');
+                    var orientation = (
+                        el.getAttribute('data-orientation') ||
+                        el.getAttribute('orientation') || ''
+                    ).toLowerCase();
+                    if (orientation === 'black') return true;
+                    if (orientation === 'white') return false;
                 }
+                text = text.toLowerCase();
+                return /(^|[\s_-])flipped([\s_-]|$)|orientation[-_ ]black|black[-_ ]bottom|player[-_ ]bottom.*black/.test(text);
+            }
+
+            function readFen() {
+                var names = ['data-fen', 'fen', 'data-position'];
+                for (var i = 0; i < names.length; i++) {
+                    var value = boardRoot.getAttribute(names[i]);
+                    if (value && /^([prnbqkPRNBQK1-8]+\/){7}[prnbqkPRNBQK1-8]+\s[wb]\s/.test(value)) {
+                        return value;
+                    }
+                }
+                // Some chess.com board builds expose FEN as a JS property.
+                try {
+                    if (typeof boardRoot.fen === 'string') return boardRoot.fen;
+                    if (typeof boardRoot.position === 'string' && boardRoot.position.indexOf('/') !== -1) {
+                        return boardRoot.position;
+                    }
+                } catch (e) {}
+                return null;
+            }
+
+            function readScreenRect() {
+                var rect = boardRoot.getBoundingClientRect();
+                var frameX = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+                var frameY = Math.max(0, window.outerHeight - window.innerHeight - frameX);
+                return [
+                    Math.round(rect.left + window.screenX + frameX),
+                    Math.round(rect.top + window.screenY + frameY),
+                    Math.round(rect.right + window.screenX + frameX),
+                    Math.round(rect.bottom + window.screenY + frameY)
+                ];
+            }
+
+            function readTurn() {
+                var attrs = ['data-turn', 'data-active-color', 'turn', 'active-color'];
+                for (var i = 0; i < attrs.length; i++) {
+                    var value = (boardRoot.getAttribute(attrs[i]) || '').toLowerCase();
+                    if (/^(w|white)$/.test(value)) return 'w';
+                    if (/^(b|black)$/.test(value)) return 'b';
+                }
+
+                // chess.com move nodes expose zero-based ply in several views.
+                // Prefer the selected/current ply, then the latest visible ply.
+                var plyNodes = document.querySelectorAll('[data-ply]');
+                var selectedPly = null, maxPly = null;
+                for (var p = 0; p < plyNodes.length; p++) {
+                    var ply = parseInt(plyNodes[p].getAttribute('data-ply'), 10);
+                    if (!Number.isFinite(ply)) continue;
+                    maxPly = maxPly === null ? ply : Math.max(maxPly, ply);
+                    var c = (typeof plyNodes[p].className === 'string' ? plyNodes[p].className : '').toLowerCase();
+                    if (/(selected|current|active)/.test(c)) selectedPly = ply;
+                }
+                var lastPly = selectedPly === null ? maxPly : selectedPly;
+                if (lastPly !== null) return ((lastPly + 1) % 2 === 0) ? 'w' : 'b';
+
+                // On live boards, the active clock provides a reliable fallback.
+                var clocks = document.querySelectorAll('[class*="clock"][class*="player-turn"], [class*="clock"][class*="active"]');
+                var boardRect = boardRoot.getBoundingClientRect();
+                for (var cidx = 0; cidx < clocks.length; cidx++) {
+                    if (!isVisible(clocks[cidx])) continue;
+                    var cr = clocks[cidx].getBoundingClientRect();
+                    var activeAtBottom = (cr.top + cr.height / 2) > (boardRect.top + boardRect.height / 2);
+                    var bottomIsBlack = readOrientation();
+                    return activeAtBottom === bottomIsBlack ? 'b' : 'w';
+                }
+                return null;
             }
 
             var out = [];
@@ -350,7 +464,15 @@ class VisionModule:
                 }
             }
 
-            return {rawNodes: rawNodes, placements: out};
+            return {
+                rawNodes: rawNodes,
+                placements: out,
+                url: window.location.href,
+                turn: readTurn(),
+                boardFlipped: readOrientation(),
+                fen: readFen(),
+                boardRect: readScreenRect()
+            };
         })()
         """
         payload = self._run_js(js)
@@ -366,12 +488,14 @@ class VisionModule:
 
         placements = payload.get("placements", [])
         raw_nodes = int(payload.get("rawNodes", 0))
+        page_url = payload.get("url", "")
         if not placements:
             print("[Vision] No pieces found — make sure you are in a chess.com game.")
             self._set_debug(
                 status="no_pieces",
                 raw_nodes=raw_nodes,
                 placed=0,
+                url=page_url,
                 message="No piece placements decoded from DOM",
             )
             return None
@@ -404,11 +528,26 @@ class VisionModule:
             )
             return None
 
-        fen = self._to_fen(board)
+        turn = payload.get("turn") if payload.get("turn") in {"w", "b"} else "w"
+        board_flipped = bool(payload.get("boardFlipped", False))
+        board_rect = payload.get("boardRect")
+        if not (
+            isinstance(board_rect, list)
+            and len(board_rect) == 4
+            and all(isinstance(value, (int, float)) for value in board_rect)
+        ):
+            board_rect = None
+        else:
+            board_rect = tuple(round(value) for value in board_rect)
+        fen = self._resolve_fen(board, turn=turn, page_fen=payload.get("fen"))
         self._set_debug(
             status="ok",
             raw_nodes=raw_nodes,
             placed=placed,
+            url=page_url,
+            turn=turn,
+            board_flipped=board_flipped,
+            board_rect=board_rect,
             message="Board decoded",
             fen=fen,
         )
@@ -493,7 +632,7 @@ class VisionModule:
         except Exception:
             return None
 
-    def _to_fen(self, board) -> str:
+    def _to_fen(self, board, turn: str = "w") -> str:
         ranks = []
         for row in board:
             s, empty = "", 0
@@ -505,5 +644,42 @@ class VisionModule:
                     s += p
             if empty: s += str(empty)
             ranks.append(s)
-        # Detect turn from board (simplified — defaults to white)
-        return "/".join(ranks) + " w KQkq - 0 1"
+        active = turn if turn in {"w", "b"} else "w"
+        return "/".join(ranks) + f" {active} - - 0 1"
+
+    def _resolve_fen(self, board, turn: str, page_fen: Optional[str]) -> str:
+        """Combine the visible pieces with trustworthy game metadata.
+
+        The DOM always gives us piece placement, but turn/castling/en-passant
+        metadata varies between chess.com views. Full page FEN is accepted only
+        when it describes the same visible pieces. For subsequent updates, a
+        matching legal move preserves exact metadata from the previous frame.
+        """
+        fallback = self._to_fen(board, turn=turn)
+        placement = fallback.split(" ", 1)[0]
+
+        if page_fen:
+            try:
+                page_board = chess.Board(page_fen)
+                if page_board.board_fen() == placement:
+                    self._last_board = page_board
+                    return page_board.fen()
+            except (ValueError, TypeError):
+                pass
+
+        if self._last_board is not None:
+            if self._last_board.board_fen() == placement:
+                return self._last_board.fen()
+
+            # Normal polling changes by one legal move. Replaying that move
+            # retains castling rights, en-passant square, clocks, and true turn.
+            for move in list(self._last_board.legal_moves):
+                candidate = self._last_board.copy(stack=False)
+                candidate.push(move)
+                if candidate.board_fen() == placement:
+                    self._last_board = candidate
+                    return candidate.fen()
+
+        resolved = chess.Board(fallback)
+        self._last_board = resolved
+        return resolved.fen()

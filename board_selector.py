@@ -32,7 +32,8 @@ class BoardSelectorWindow(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setGeometry(QApplication.primaryScreen().geometry())
+        # Allow selecting a browser board on any monitor.
+        self.setGeometry(QApplication.primaryScreen().virtualGeometry())
 
     # ── Show / Auto-detect ────────────────────────────────────────────────
 
